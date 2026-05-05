@@ -1,0 +1,1 @@
+  docker run --rm -p 9091:8001 --env-file .env voicechat-b
