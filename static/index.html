@@ -34,21 +34,21 @@
   </style>
 </head>
 <body>
-  <h1>Aria <span id="status" class="pill">idle</span></h1>
+  <h1>Aria</h1>
   <div class="row">
     <div class="stage-col">
       <div class="stage">
         <canvas id="avatar"></canvas>
         <div id="state" class="state-pill">—</div>
       </div>
-      <label id="vrmFileLabel" hidden>VRM model: <input id="vrmFile" type="file" accept=".vrm" /></label>
+      <label id="vrmFileLabel" hidden>Custom VRM (optional): <input id="vrmFile" type="file" accept=".vrm" /></label>
     </div>
     <div class="controls">
       <video id="cam" autoplay muted playsinline></video>
       <label>Avatar:
         <select id="mode">
-          <option value="robot">Robot</option>
           <option value="vrm">VRM model</option>
+          <option value="robot">Robot</option>
         </select>
       </label>
       <button id="start">Start call</button>
@@ -63,6 +63,7 @@ import { EmojiAvatar } from '/static/emoji-avatar.js';
 
 const VIDEO_FPS = 1;
 const SAMPLE_RATE_IN = 16000;
+const DEFAULT_VRM_URL = '/models/1553601332594196454.vrm';
 
 const el = (id) => document.getElementById(id);
 const log = (m, cls='') => { const span = document.createElement('span'); span.className = cls; span.textContent = m + '\n'; el('log').appendChild(span); el('log').scrollTop = 1e9; };
@@ -79,6 +80,13 @@ function setMode(mode) {
   avatar = mode === 'vrm' ? new VrmAvatar(next) : new EmojiAvatar(next);
   if (micAnalyser || playbackAnalyser) avatar.attachAudio({ micAnalyser, playbackAnalyser });
   el('vrmFileLabel').hidden = mode !== 'vrm';
+  if (mode === 'vrm') {
+    const target = avatar;
+    log('loading default vrm…');
+    target.loadFromUrl(DEFAULT_VRM_URL)
+      .then(() => { if (target === avatar) log('vrm loaded'); })
+      .catch((err) => { if (target === avatar) log('vrm load failed: ' + err.message); });
+  }
 }
 
 let ws, mediaStream, audioCtx, workletNode, videoTimer;
