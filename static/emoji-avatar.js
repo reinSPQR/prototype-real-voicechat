@@ -8,6 +8,18 @@ const PLAYBACK_THRESHOLD = 0.015;
 const IDLE_TO_SLEEP_MS = 10_000;
 const TRANSITION_TAU = 0.35;
 
+// The robot has fewer knobs than VRM, so we project each backend emotion onto
+// (mouth-curve, screen-brightness). Applied only while talking.
+const EMOTION_ROBOT_MAP = {
+  excited: { smile:  0.9, brightness: 1.15 },
+  happy:   { smile:  0.7, brightness: 1.05 },
+  sad:     { smile: -0.6, brightness: 0.75 },
+  angry:   { smile: -0.4, brightness: 1.10 },
+  calm:    { smile:  0.2, brightness: 0.95 },
+  whisper: { smile:  0.1, brightness: 0.80 },
+  neutral: { smile:  0.0, brightness: 1.00 },
+};
+
 const GLOW = 'rgba(140, 230, 255, 1)';
 const SHELL = '#e8ecf3';
 const EAR = '#cdd2dc';
@@ -21,6 +33,7 @@ export class EmojiAvatar {
     this.lastActivity = Date.now();
     this._mouth = 0;
     this._thinking = false;
+    this._emotion = null;
     this._smooth = {
       eyeOpen: 1,     // 1 fully open, 0 closed
       gazeY: 0,       // pupil vertical offset, -1 up, 1 down
@@ -50,6 +63,11 @@ export class EmojiAvatar {
   }
 
   setThinking(on) { this._thinking = !!on; }
+  setEmotion(emotion) {
+    if (!emotion) return;
+    const e = String(emotion).toLowerCase();
+    if (EMOTION_ROBOT_MAP[e]) this._emotion = e;
+  }
   getState() { return this.state; }
   dispose() { this._disposed = true; }
 
@@ -84,11 +102,18 @@ export class EmojiAvatar {
 
   _stateTargets() {
     const s = this.state;
+    let smile = s === 'listening' ? 0.7 : s === 'sleeping' ? -0.1 : 0.15;
+    let brightness = s === 'sleeping' ? 0.4 : 1;
+    if (s === 'talking' && this._emotion && EMOTION_ROBOT_MAP[this._emotion]) {
+      const m = EMOTION_ROBOT_MAP[this._emotion];
+      smile = m.smile;
+      brightness = m.brightness;
+    }
     return {
       eyeOpen:    s === 'sleeping' ? 0.05 : 1,
       gazeY:      s === 'thinking' ? -0.6 : 0,
-      smile:      s === 'listening' ? 0.7 : s === 'sleeping' ? -0.1 : 0.15,
-      brightness: s === 'sleeping' ? 0.4 : 1,
+      smile,
+      brightness,
       accentDots: s === 'thinking' ? 1 : 0,
       accentZ:    s === 'sleeping' ? 1 : 0,
       ringPulse:  s === 'listening' ? 1 : 0,

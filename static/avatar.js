@@ -20,6 +20,20 @@ const IDLE_TO_SLEEP_MS = 10_000;
 // Time constant for state-transition smoothing (seconds). Lower = snappier.
 const TRANSITION_TAU = 0.35;
 
+// Backend emotion preset → VRM expression weights. Applied only while talking.
+// 'excited' / 'Surprised' may not exist on every VRM; setValue silently no-ops
+// for unknown expression names, so the model still expresses what it can.
+const EMOTION_VRM_MAP = {
+  excited: { surprised: 0.5, excited: 0.5 },
+  happy:   { happy: 1.0 },
+  sad:     { sad: 1.0 },
+  angry:   { angry: 1.0 },
+  calm:    { relaxed: 1.0 },
+  whisper: { neutral: 0.5, relaxed: 0.5 },
+  neutral: { neutral: 1.0 },
+};
+const EMO_KEYS = ['neutral', 'angry', 'happy', 'sad', 'relaxed', 'surprised', 'excited'];
+
 export class Avatar {
   constructor(canvas) {
     this.canvas = canvas;
@@ -27,8 +41,10 @@ export class Avatar {
     this.lastActivity = Date.now();
     this._mouth = 0;
     this._thinking = false;
+    this._emotion = null;
     // Smoothed values that lerp toward per-state targets each frame.
     this._smooth = { headX: 0, headZ: 0, relaxed: 0, happy: 0, lookUp: 0, eyesClosed: 0 };
+    this._emoSmooth = Object.fromEntries(EMO_KEYS.map(k => [k, 0]));
     this._initScene();
     this._loop();
   }
@@ -113,6 +129,12 @@ export class Avatar {
     this._thinking = !!on;
   }
 
+  setEmotion(emotion) {
+    if (!emotion) return;
+    const e = String(emotion).toLowerCase();
+    if (EMOTION_VRM_MAP[e]) this._emotion = e;
+  }
+
   _rms(analyser) {
     if (!analyser) return 0;
     const data = new Uint8Array(analyser.fftSize);
@@ -151,18 +173,29 @@ export class Avatar {
     for (const key in this._smooth) {
       this._smooth[key] += (tgt[key] - this._smooth[key]) * k;
     }
+    const emoTgt = (this.state === 'talking' && this._emotion)
+      ? (EMOTION_VRM_MAP[this._emotion] || {}) : {};
+    for (const key of EMO_KEYS) {
+      this._emoSmooth[key] += ((emoTgt[key] || 0) - this._emoSmooth[key]) * k;
+    }
   }
 
   _applyExpressions(t) {
     const expr = this.vrm.expressionManager;
     if (!expr) return;
-    const s = this._smooth;
+    const s = this._smooth, e = this._emoSmooth;
 
     expr.setValue('aa', this._mouth);
     expr.setValue('blink', Math.max(this._blink(t), s.eyesClosed));
-    expr.setValue('happy', s.happy);
-    expr.setValue('relaxed', s.relaxed);
-    expr.setValue('sad', 0);
+    // Emotion-driven weights (talking) layered onto the existing state-driven
+    // happy/relaxed (listening/sleeping/thinking) — Math.max keeps both visible.
+    expr.setValue('happy',     Math.max(s.happy,   e.happy));
+    expr.setValue('relaxed',   Math.max(s.relaxed, e.relaxed));
+    expr.setValue('sad',       e.sad);
+    expr.setValue('angry',     e.angry);
+    expr.setValue('surprised', e.surprised);
+    expr.setValue('neutral',   e.neutral);
+    expr.setValue('excited',   e.excited);
     if (expr.getExpression?.('lookUp')) {
       expr.setValue('lookUp', s.lookUp);
     }

@@ -178,6 +178,9 @@ async function onServerMessage(ev) {
   } else if (msg.type === 'user_transcript') {
     avatar.setThinking(true);
     log('you: ' + msg.text, 'you');
+  } else if (msg.type === 'emotion') {
+    avatar.setEmotion?.(msg.emotion);
+    log('emotion: ' + msg.emotion);
   } else if (msg.type === 'assistant_text') {
     log('aria: ' + msg.text, 'her');
   } else if (msg.type === 'interrupted') {

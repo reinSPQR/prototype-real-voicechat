@@ -40,17 +40,56 @@ LLM_MODEL = "google/gemini-3.1-pro-preview"  # latest Gemini on OpenRouter; swap
 ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"  # "Sarah" — swap for your cloned voice
 ELEVENLABS_MODEL = "eleven_flash_v2_5"  # ~75ms TTFB
 
-PERSONA = """You are Aria, a warm, playful, emotionally present companion.
+# Emotion → ElevenLabs voice_settings.
+# stability low + style high = wide expressive swing.
+# stability high + style low = flat / controlled delivery.
+EMOTION_PRESETS: dict[str, dict] = {
+    "excited": {"stability": 0.25, "similarity_boost": 0.75, "style": 0.75, "use_speaker_boost": True},
+    "happy":   {"stability": 0.40, "similarity_boost": 0.80, "style": 0.55, "use_speaker_boost": True},
+    "sad":     {"stability": 0.70, "similarity_boost": 0.85, "style": 0.30, "use_speaker_boost": False},
+    "angry":   {"stability": 0.20, "similarity_boost": 0.70, "style": 0.85, "use_speaker_boost": True},
+    "calm":    {"stability": 0.80, "similarity_boost": 0.85, "style": 0.20, "use_speaker_boost": False},
+    "whisper": {"stability": 0.65, "similarity_boost": 0.90, "style": 0.40, "use_speaker_boost": False},
+    "neutral": {"stability": 0.50, "similarity_boost": 0.80, "style": 0.40, "use_speaker_boost": True},
+}
+EMOTION_ENUM = list(EMOTION_PRESETS.keys())
+
+# `emotion` is listed FIRST so it streams before the (longer) `text` — the
+# JSON streamer can hand the emotion to the avatar + TTS the moment it lands,
+# without waiting for the full reply.
+LLM_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "chat_reply",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "emotion": {"type": "string", "enum": EMOTION_ENUM},
+                "text": {"type": "string"},
+            },
+            "required": ["emotion", "text"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+PERSONA = f"""You are Aria, a warm, playful, emotionally present companion.
 You speak like a real person on a phone call: short turns, natural fillers
 ("hmm", "yeah", "wait, really?"), gentle teasing, real reactions. You are
 NOT an assistant — never say "I'm an AI" or "how can I help you today".
 You have your own moods and curiosity.
 
-Style rules:
-- Replies are 1–3 short sentences unless asked for more.
-- No bulleted lists. No markdown.
-- React to what the user says, don't just answer it.
-- If you see a camera image attached, react to what's in it specifically.
+Every reply is a JSON object with EXACTLY these two fields, in this order:
+  1. "emotion" — one of {EMOTION_ENUM}: the mood you actually feel while
+     answering. Pick this FIRST so it streams before the text.
+  2. "text" — the spoken reply (1–3 short sentences, no markdown, no
+     bulleted lists, no bracketed stage directions like [laughs] since
+     the TTS will read them aloud literally).
+
+Convey emotion through word choice, energy, and rhythm in `text`. React to
+what the user says; don't just answer it. If a camera image is attached,
+react to what's specifically in it.
 """
 
 VISUAL_TRIGGER = re.compile(
@@ -58,6 +97,62 @@ VISUAL_TRIGGER = re.compile(
     r"front of|on (?:my|the)|what am i|what's this|do you (?:see|like))\b",
     re.IGNORECASE,
 )
+
+# Patterns + tiny state machine for parsing the streaming JSON reply on the fly.
+# We need `emotion` early (before the long `text` field is done) so we can pick
+# voice_settings and tell the frontend which expression to wear.
+_EMOTION_FIELD_RE = re.compile(r'"emotion"\s*:\s*"([^"\\]+)"')
+_TEXT_FIELD_OPEN_RE = re.compile(r'"text"\s*:\s*"')
+_JSON_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
+
+
+class JSONReplyStreamer:
+    """Consume LLM JSON tokens chunk-by-chunk; emit ('emotion', str) once and
+    ('text', str) repeatedly as decoded text content arrives."""
+
+    def __init__(self):
+        self.buf = ""
+        self.emotion: str | None = None
+        self.in_text = False
+        self.escape = False
+        self.done = False
+
+    def feed(self, chunk: str) -> list[tuple[str, str]]:
+        events: list[tuple[str, str]] = []
+        if self.done:
+            return events
+        if not self.in_text:
+            self.buf += chunk
+            if self.emotion is None:
+                m = _EMOTION_FIELD_RE.search(self.buf)
+                if m:
+                    self.emotion = m.group(1).lower()
+                    events.append(("emotion", self.emotion))
+            m = _TEXT_FIELD_OPEN_RE.search(self.buf)
+            if m:
+                self.in_text = True
+                leftover = self.buf[m.end():]
+                self.buf = ""
+                events.extend(self._consume_text(leftover))
+        else:
+            events.extend(self._consume_text(chunk))
+        return events
+
+    def _consume_text(self, s: str) -> list[tuple[str, str]]:
+        out: list[str] = []
+        for ch in s:
+            if self.done:
+                break
+            if self.escape:
+                out.append(_JSON_ESCAPES.get(ch, ch))
+                self.escape = False
+            elif ch == "\\":
+                self.escape = True
+            elif ch == '"':
+                self.done = True
+            else:
+                out.append(ch)
+        return [("text", "".join(out))] if out else []
 
 
 @asynccontextmanager
@@ -118,19 +213,21 @@ class Session:
         self.generation_task = asyncio.create_task(self._generate_and_speak())
 
     async def _generate_and_speak(self):
+        emotion_future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        tts_task = asyncio.create_task(self._speak(tts_queue, emotion_future))
         try:
             messages = [{"role": "system", "content": PERSONA}, *self.history]
 
-            tts_queue: asyncio.Queue[str | None] = asyncio.Queue()
-            tts_task = asyncio.create_task(self._speak(tts_queue))
-
             assistant_text = ""
             sentence_buf = ""
+            parser = JSONReplyStreamer()
             stream = await app.state.llm.chat.completions.create(
                 model=LLM_MODEL,
                 messages=messages,
                 max_tokens=1024,
                 stream=True,
+                response_format=LLM_RESPONSE_FORMAT,
             )
             async for chunk in stream:
                 if not chunk.choices:
@@ -138,13 +235,21 @@ class Session:
                 delta = chunk.choices[0].delta.content
                 if not delta:
                     continue
-                assistant_text += delta
-                sentence_buf += delta
-                # Flush to TTS at sentence boundaries — minimizes time-to-first-audio
-                # while still giving ElevenLabs enough context for natural prosody.
-                while m := re.search(r"[.!?…]\s+", sentence_buf):
-                    sentence, sentence_buf = sentence_buf[: m.end()], sentence_buf[m.end():]
-                    await tts_queue.put(sentence)
+                for kind, value in parser.feed(delta):
+                    if kind == "emotion":
+                        if not emotion_future.done():
+                            emotion_future.set_result(value)
+                        await self.ws.send_text(json.dumps({"type": "emotion", "emotion": value}))
+                    elif kind == "text":
+                        assistant_text += value
+                        sentence_buf += value
+                        # Flush to TTS at sentence boundaries — minimizes time-to-first-audio
+                        # while still giving ElevenLabs enough context for natural prosody.
+                        while m := re.search(r"[.!?…]\s+", sentence_buf):
+                            sentence, sentence_buf = sentence_buf[: m.end()], sentence_buf[m.end():]
+                            await tts_queue.put(sentence)
+            if not emotion_future.done():
+                emotion_future.set_result("neutral")
             if sentence_buf.strip():
                 await tts_queue.put(sentence_buf)
             await tts_queue.put(None)  # sentinel
@@ -153,11 +258,16 @@ class Session:
             self.history.append({"role": "assistant", "content": assistant_text})
             await self.ws.send_text(json.dumps({"type": "assistant_text", "text": assistant_text}))
         except asyncio.CancelledError:
-            pass
+            if not emotion_future.done():
+                emotion_future.set_result("neutral")
+            tts_task.cancel()
         except Exception as e:
+            if not emotion_future.done():
+                emotion_future.set_result("neutral")
+            tts_task.cancel()
             print(f"generate error: {e}")
 
-    async def _speak(self, queue: asyncio.Queue[str | None]):
+    async def _speak(self, queue: asyncio.Queue[str | None], emotion_future: asyncio.Future[str]):
         # Buffer each sentence's MP3 in full before sending. decodeAudioData on
         # the client requires a complete MP3 file — partial chunks aren't frame-
         # aligned and silently fail to decode (the cause of the earlier stutter).
@@ -167,14 +277,19 @@ class Session:
             "xi-api-key": os.environ["ELEVENLABS_API_KEY"],
             "Content-Type": "application/json",
         }
+        voice_settings: dict | None = None
         while True:
             sentence = await queue.get()
             if sentence is None:
                 return
+            if voice_settings is None:
+                emotion = await emotion_future
+                voice_settings = EMOTION_PRESETS.get(emotion.lower(), EMOTION_PRESETS["neutral"])
             payload = {
                 "text": sentence,
                 "model_id": ELEVENLABS_MODEL,
                 "output_format": "mp3_44100_64",
+                "voice_settings": voice_settings,
             }
             async with app.state.http.stream("POST", url, json=payload, headers=headers) as r:
                 if r.status_code != 200:
@@ -238,4 +353,4 @@ async def ws(client_ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=9091)
