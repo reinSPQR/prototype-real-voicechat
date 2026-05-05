@@ -53,6 +53,11 @@
       </label>
       <button id="start">Start call</button>
       <button id="stop" disabled>Hang up</button>
+      <form id="textForm" style="display:flex; gap:6px;">
+        <input id="textInput" type="text" placeholder="type to send…" autocomplete="off"
+               style="flex:1; padding:8px; border-radius:6px; border:1px solid #444; background:#222; color:#eee;" />
+        <button type="submit" id="textSend" disabled>Send</button>
+      </form>
       <div>Connection: <span id="status" class="pill">idle</span></div>
       <div id="log"></div>
     </div>
@@ -117,8 +122,8 @@ async function start() {
   el('cam').srcObject = mediaStream;
 
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => { setStatus('live', true); log('connected'); };
-  ws.onclose = () => { setStatus('closed'); log('closed'); };
+  ws.onopen = () => { setStatus('live', true); log('connected'); el('textSend').disabled = false; };
+  ws.onclose = () => { setStatus('closed'); log('closed'); el('textSend').disabled = true; };
   ws.onmessage = onServerMessage;
 
   await pumpAudio();
@@ -211,6 +216,14 @@ async function scheduleMp3(b64) {
 
 el('start').onclick = start;
 el('stop').onclick = stop;
+
+el('textForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const text = el('textInput').value.trim();
+  if (!text || ws?.readyState !== 1) return;
+  ws.send(JSON.stringify({ type: 'text', text }));
+  el('textInput').value = '';
+});
 </script>
 </body>
 </html>

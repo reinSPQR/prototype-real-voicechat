@@ -339,10 +339,14 @@ async def ws(client_ws: WebSocket):
         while True:
             msg = await client_ws.receive_text()
             data = json.loads(msg)
+
             if data["type"] == "audio":
                 await dg.send(base64.b64decode(data["data"]))
             elif data["type"] == "video":
                 session.latest_frame_b64 = data["data"]
+            elif data["type"] == "text":
+                print(data)
+                await session.on_user_text(data.get("text", ""))
     except WebSocketDisconnect:
         pass
     finally:
