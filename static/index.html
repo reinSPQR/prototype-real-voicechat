@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Path B — Pipelined</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.166.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.166.0/examples/jsm/",
+      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.0/lib/three-vrm.module.js"
+    }
+  }
+  </script>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 24px; }
+    h1 { margin-top: 0; font-weight: 500; }
+    .row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+    .stage-col { display: flex; flex-direction: column; gap: 10px; }
+    .stage { position: relative; width: 360px; height: 480px; background: linear-gradient(180deg, #251b25, #140d14); border-radius: 12px; overflow: hidden; }
+    #avatar { width: 100%; height: 100%; display: block; }
+    .state-pill { position: absolute; top: 8px; left: 8px; padding: 4px 10px; border-radius: 999px; background: rgba(0,0,0,0.5); font-size: 11px; font-family: ui-monospace, monospace; }
+    video { width: 220px; border-radius: 8px; background: #000; }
+    .controls { display: flex; flex-direction: column; gap: 10px; max-width: 320px; }
+    button { padding: 10px 18px; font-size: 16px; border-radius: 8px; border: 0; background: #d8a; color: #000; cursor: pointer; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    input[type=file] { color: #aaa; font-size: 12px; }
+    label { font-size: 13px; color: #aaa; }
+    #log { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12px; opacity: 0.85; max-height: 220px; overflow-y: auto; }
+    .pill { display: inline-block; padding: 4px 10px; border-radius: 999px; background: #333; font-size: 12px; margin-left: 8px; }
+    .on { background: #d8a; color: #000; }
+    .you { color: #8cf; }
+    .her { color: #fc8; }
+  </style>
+</head>
+<body>
+  <h1>Aria <span id="status" class="pill">idle</span></h1>
+  <div class="row">
+    <div class="stage-col">
+      <div class="stage">
+        <canvas id="avatar"></canvas>
+        <div id="state" class="state-pill">—</div>
+      </div>
+      <label id="vrmFileLabel" hidden>VRM model: <input id="vrmFile" type="file" accept=".vrm" /></label>
+    </div>
+    <div class="controls">
+      <video id="cam" autoplay muted playsinline></video>
+      <label>Avatar:
+        <select id="mode">
+          <option value="robot">Robot</option>
+          <option value="vrm">VRM model</option>
+        </select>
+      </label>
+      <button id="start">Start call</button>
+      <button id="stop" disabled>Hang up</button>
+      <div id="log"></div>
+    </div>
+  </div>
+
+<script type="module">
+import { Avatar as VrmAvatar } from '/static/avatar.js';
+import { EmojiAvatar } from '/static/emoji-avatar.js';
+
+const VIDEO_FPS = 1;
+const SAMPLE_RATE_IN = 16000;
+
+const el = (id) => document.getElementById(id);
+const log = (m, cls='') => { const span = document.createElement('span'); span.className = cls; span.textContent = m + '\n'; el('log').appendChild(span); el('log').scrollTop = 1e9; };
+const setStatus = (s, on=false) => { el('status').textContent = s; el('status').className = 'pill' + (on ? ' on' : ''); };
+
+let avatar;
+function setMode(mode) {
+  avatar?.dispose?.();
+  // A canvas can't switch between WebGL and 2D contexts, so replace the element.
+  const old = el('avatar');
+  const next = document.createElement('canvas');
+  next.id = 'avatar';
+  old.parentNode.replaceChild(next, old);
+  avatar = mode === 'vrm' ? new VrmAvatar(next) : new EmojiAvatar(next);
+  if (micAnalyser || playbackAnalyser) avatar.attachAudio({ micAnalyser, playbackAnalyser });
+  el('vrmFileLabel').hidden = mode !== 'vrm';
+}
+
+let ws, mediaStream, audioCtx, workletNode, videoTimer;
+let playbackCtx, playhead = 0, playbackAnalyser, micAnalyser;
+
+setMode(el('mode').value);
+setInterval(() => { el('state').textContent = avatar.getState(); }, 100);
+
+el('mode').addEventListener('change', (e) => setMode(e.target.value));
+
+el('vrmFile').addEventListener('change', async (e) => {
+  const f = e.target.files?.[0];
+  if (!f) return;
+  log('loading vrm…');
+  try { await avatar.loadFromFile(f); log('vrm loaded'); }
+  catch (err) { log('vrm load failed: ' + err.message); }
+});
+
+async function start() {
+  el('start').disabled = true;
+  setStatus('connecting');
+
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
+    video: { width: 640, height: 480 },
+  });
+  el('cam').srcObject = mediaStream;
+
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { setStatus('live', true); log('connected'); };
+  ws.onclose = () => { setStatus('closed'); log('closed'); };
+  ws.onmessage = onServerMessage;
+
+  await pumpAudio();
+  pumpVideo();
+  el('stop').disabled = false;
+}
+
+function stop() {
+  el('stop').disabled = true;
+  if (videoTimer) clearInterval(videoTimer);
+  if (workletNode) workletNode.disconnect();
+  if (audioCtx) audioCtx.close();
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  if (ws) ws.close();
+  setStatus('idle');
+  el('start').disabled = false;
+}
+
+async function pumpAudio() {
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+  await audioCtx.audioWorklet.addModule('/static/recorder.js');
+  const src = audioCtx.createMediaStreamSource(mediaStream);
+
+  micAnalyser = audioCtx.createAnalyser();
+  micAnalyser.fftSize = 512;
+  src.connect(micAnalyser);
+
+  workletNode = new AudioWorkletNode(audioCtx, 'recorder', { processorOptions: { targetRate: SAMPLE_RATE_IN }});
+  workletNode.port.onmessage = (e) => {
+    if (ws?.readyState !== 1) return;
+    ws.send(JSON.stringify({ type: 'audio', data: btoa(String.fromCharCode(...new Uint8Array(e.data))) }));
+  };
+  src.connect(workletNode);
+
+  avatar.attachAudio({ micAnalyser, playbackAnalyser });
+}
+
+function pumpVideo() {
+  const video = el('cam');
+  const canvas = document.createElement('canvas');
+  canvas.width = 640; canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+  videoTimer = setInterval(async () => {
+    if (ws?.readyState !== 1 || video.videoWidth === 0) return;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.7));
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    ws.send(JSON.stringify({ type: 'video', data: btoa(String.fromCharCode(...buf)) }));
+  }, 1000 / VIDEO_FPS);
+}
+
+async function onServerMessage(ev) {
+  const msg = JSON.parse(ev.data);
+  if (msg.type === 'audio_mp3') {
+    avatar.setThinking(false);
+    await scheduleMp3(msg.data);
+  } else if (msg.type === 'user_transcript') {
+    avatar.setThinking(true);
+    log('you: ' + msg.text, 'you');
+  } else if (msg.type === 'assistant_text') {
+    log('aria: ' + msg.text, 'her');
+  } else if (msg.type === 'interrupted') {
+    avatar.setThinking(false);
+    playhead = 0;
+    log('-- interrupted --');
+  }
+}
+
+async function scheduleMp3(b64) {
+  if (!playbackCtx) {
+    playbackCtx = new AudioContext();
+    playbackAnalyser = playbackCtx.createAnalyser();
+    playbackAnalyser.fftSize = 512;
+    playbackAnalyser.connect(playbackCtx.destination);
+    avatar.attachAudio({ micAnalyser, playbackAnalyser });
+  }
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const decoded = await playbackCtx.decodeAudioData(bytes.buffer.slice(0));
+  const src = playbackCtx.createBufferSource();
+  src.buffer = decoded;
+  src.connect(playbackAnalyser);
+  const now = playbackCtx.currentTime;
+  if (playhead < now) playhead = now;
+  src.start(playhead);
+  playhead += decoded.duration;
+}
+
+el('start').onclick = start;
+el('stop').onclick = stop;
+</script>
+</body>
+</html>
