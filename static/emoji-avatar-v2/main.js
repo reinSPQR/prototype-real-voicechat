@@ -9,10 +9,10 @@
 //   - ExpressionManager smooths weights toward that target and resolves a
 //     flat parameter dict;
 //   - FaceRig renders the face from those params (eyes, mouth);
-//   - this file owns the floating effects (! / … / ZZZ) and applies
-//     body-motion oscillations (breathing/headBob/headTilt/tremor) from
-//     the same param dict. There is no chassis; the face renders against
-//     the canvas's transparent background.
+//   - this file owns the chassis (egg-shaped body, dark screen plate, two
+//     antennae — modelled after static/ezgif-split/), the floating effects
+//     (! / … / ZZZ), and applies body-motion oscillations
+//     (breathing/headBob/headTilt/tremor/antennaWag) from the same dict.
 
 import * as THREE from 'three';
 
@@ -98,24 +98,187 @@ export class EmojiAvatarV2 {
     this.scene = new THREE.Scene();
 
     this.camera = new THREE.PerspectiveCamera(40, 1, 0.1, 100);
-    this.camera.position.set(0, 0.9, 5.5);
-    this.camera.lookAt(0, 0.9, 0);
+    this.camera.position.set(0, 0.85, 5.5);
+    this.camera.lookAt(0, 0.85, 0);
 
-    // No lights — face primitives are MeshBasicMaterial (self-glowing).
+    // Lights — body & screen use MeshStandardMaterial. Face primitives are
+    // MeshBasicMaterial (self-glowing) and ignore lighting.
+    // Ambient is high so the white shell reads near-white instead of mid-gray.
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.95));
+    const key = new THREE.DirectionalLight(0xffffff, 0.85);
+    key.position.set(-2.5, 4, 4);
+    this.scene.add(key);
+    // Warm fill on the camera-right keeps the right side from collapsing
+    // into shadow while the cool rim still defines the back contour.
+    const fill = new THREE.DirectionalLight(0xfff2e6, 0.45);
+    fill.position.set(3, 2, 3);
+    this.scene.add(fill);
+    const rim = new THREE.DirectionalLight(0x9fc4d8, 0.35);
+    rim.position.set(3, 1, -2);
+    this.scene.add(rim);
 
     this.deviceGroup = new THREE.Group();
     this.scene.add(this.deviceGroup);
 
-    // Face anchor.
+    this._buildBody();
+
+    // Face anchor — centered on the screen plate.
     this.faceAnchor = new THREE.Group();
-    this.faceAnchor.position.set(0, 0.9, 0);
+    this.faceAnchor.position.set(0, 0.85, 0);
     this.deviceGroup.add(this.faceAnchor);
 
-    // Floating-effects anchor — above the face.
+    // Floating-effects anchor — above the body, between the antennae.
     this.effectsAnchor = new THREE.Group();
-    this.effectsAnchor.position.set(0, 1.55, 0);
+    this.effectsAnchor.position.set(0, 2.20, -0.3);
     this.deviceGroup.add(this.effectsAnchor);
     this._buildEffects();
+  }
+
+  // Body chassis (per the reference PNGs in static/ezgif-split/):
+  //   - egg-shaped white shell (squat — distinctly wider than tall)
+  //   - dark rounded-rectangle screen on the front, where the face glows
+  //   - two slim antennae at the shoulders, tilted slightly outward
+  //   - cartoon-style outline using the inflated-BackSide trick
+  //
+  // Z layout (positive = toward camera):
+  //   body center: z = -1.25, scaled radius_z = 1.18 → front apex z ≈ -0.07
+  //   screen outline:                       z = -0.06
+  //   screen:                               z = -0.05
+  //   face primitives:                      z = 0.00 to +0.06  (front-most)
+  _buildBody() {
+    // Squat egg — wider than tall, slightly less deep than wide.
+    const BODY_X = 1.50, BODY_Y = 1.00, BODY_Z = 1.18;
+    const BODY_Y0 = 0.85, BODY_Z0 = -1.25;
+    this._bodyDims = { BODY_X, BODY_Y, BODY_Z, BODY_Y0, BODY_Z0 };
+
+    // Cartoon outline — inflated BackSide-only sphere shows as a black
+    // silhouette ring around the body's profile. Inflated 7% so the ring
+    // is actually visible against both the body interior and the dark
+    // background; renderOrder pushes it behind the body's front faces.
+    const outline = new THREE.Mesh(
+      new THREE.SphereGeometry(1.0, 48, 32),
+      new THREE.MeshBasicMaterial({ color: 0x05080c, side: THREE.BackSide }),
+    );
+    outline.position.set(0, BODY_Y0, BODY_Z0);
+    outline.scale.set(BODY_X * 1.07, BODY_Y * 1.08, BODY_Z * 1.07);
+    outline.renderOrder = -1;
+    this.deviceGroup.add(outline);
+
+    // Body shell — bright white egg with subtle shading from the lights above.
+    const body = new THREE.Mesh(
+      new THREE.SphereGeometry(1.0, 48, 32),
+      new THREE.MeshStandardMaterial({
+        color: 0xfafbfd, roughness: 0.55, metalness: 0.05,
+      }),
+    );
+    body.position.set(0, BODY_Y0, BODY_Z0);
+    body.scale.set(BODY_X, BODY_Y, BODY_Z);
+    this.deviceGroup.add(body);
+    this._body = body;
+
+    // Screen plate sits at the body's vertical center (in front of body apex).
+    const SCREEN_Y = BODY_Y0;
+    const SCREEN_Z = -0.05;
+
+    // Screen outline (slightly larger black rounded rect, behind the screen).
+    const screenOutline = new THREE.Mesh(
+      new THREE.ShapeGeometry(this._makeRoundedRect(2.00, 1.30, 0.24), 12),
+      new THREE.MeshBasicMaterial({ color: 0x05080c }),
+    );
+    screenOutline.position.set(0, SCREEN_Y, SCREEN_Z - 0.01);
+    this.deviceGroup.add(screenOutline);
+
+    // Screen — dark rounded rect, slightly forward of body apex.
+    const screen = new THREE.Mesh(
+      new THREE.ShapeGeometry(this._makeRoundedRect(1.85, 1.15, 0.20), 12),
+      new THREE.MeshStandardMaterial({
+        color: 0x0a1218, roughness: 0.30, metalness: 0.15,
+      }),
+    );
+    screen.position.set(0, SCREEN_Y, SCREEN_Z);
+    this.deviceGroup.add(screen);
+    this._screen = screen;
+
+    // Antennae sit at the body's shoulders, slightly INSIDE the silhouette
+    // so they read as growing out of the shell rather than floating above.
+    // Pivot y picks the body surface y at x = ±ANT_X, then we drop a hair
+    // further so the stalk base gets occluded by the body for the
+    // shoulder-blend look in the reference.
+    this._antennae = [];
+    this._buildAntenna(-0.95);
+    this._buildAntenna(+0.95);
+  }
+
+  _makeRoundedRect(w, h, r) {
+    const W = w / 2, H = h / 2;
+    const s = new THREE.Shape();
+    s.moveTo(-W + r, -H);
+    s.lineTo(W - r, -H);
+    s.quadraticCurveTo( W, -H,  W, -H + r);
+    s.lineTo(W, H - r);
+    s.quadraticCurveTo( W,  H,  W - r,  H);
+    s.lineTo(-W + r, H);
+    s.quadraticCurveTo(-W,  H, -W,  H - r);
+    s.lineTo(-W, -H + r);
+    s.quadraticCurveTo(-W, -H, -W + r, -H);
+    return s;
+  }
+
+  _buildAntenna(x) {
+    const sign  = x < 0 ? -1 : +1;
+    const pivot = new THREE.Group();
+    // Pivot sits a hair below the body's shoulder so the stalk base is
+    // occluded by the shell and the antenna reads as attached, not floating.
+    // Body-surface y at x=±0.95 with BODY_X=1.50, BODY_Y=1.00, BODY_Y0=0.85:
+    //   y = 0.85 + 1.00 * sqrt(1 - (0.95/1.50)^2) ≈ 0.85 + 0.776 ≈ 1.626
+    pivot.position.set(x, 1.55, -0.40);
+    pivot.userData.sign     = sign;
+    pivot.userData.baseTilt = sign * 0.18;            // ~10° outward
+    pivot.rotation.z        = pivot.userData.baseTilt;
+
+    const STALK_LEN = 0.42;
+    const BALL_R    = 0.12;
+
+    // Stalk + outline (a slightly-larger BackSide cylinder gives the dark ring).
+    const stalk = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.045, 0.045, STALK_LEN, 16),
+      new THREE.MeshStandardMaterial({
+        color: 0xc6cdd6, roughness: 0.4, metalness: 0.35,
+      }),
+    );
+    stalk.position.y = STALK_LEN / 2;
+    pivot.add(stalk);
+
+    const stalkOutline = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.045, 0.045, STALK_LEN, 16),
+      new THREE.MeshBasicMaterial({ color: 0x05080c, side: THREE.BackSide }),
+    );
+    stalkOutline.position.y = STALK_LEN / 2;
+    stalkOutline.scale.set(1.35, 1.02, 1.35);   // thin objects need a bigger %
+    stalkOutline.renderOrder = -1;
+    pivot.add(stalkOutline);
+
+    // Ball + outline.
+    const ball = new THREE.Mesh(
+      new THREE.SphereGeometry(BALL_R, 24, 16),
+      new THREE.MeshStandardMaterial({
+        color: 0xeef0f3, roughness: 0.3, metalness: 0.2,
+      }),
+    );
+    ball.position.y = STALK_LEN + BALL_R * 0.35;
+    pivot.add(ball);
+
+    const ballOutline = new THREE.Mesh(
+      new THREE.SphereGeometry(BALL_R, 24, 16),
+      new THREE.MeshBasicMaterial({ color: 0x05080c, side: THREE.BackSide }),
+    );
+    ballOutline.position.copy(ball.position);
+    ballOutline.scale.setScalar(1.18);
+    ballOutline.renderOrder = -1;
+    pivot.add(ballOutline);
+
+    this.deviceGroup.add(pivot);
+    this._antennae.push(pivot);
   }
 
   // Floating effects: '!', '...' bubble, and 'ZZZ'. Each lives in its own
@@ -237,10 +400,9 @@ export class EmojiAvatarV2 {
   }
 
   // The rig publishes amplitude scalars (headTilt, headBob, breathing,
-  // tremor) on the resolved param dict. Here we apply the actual
-  // oscillations to the face transform. (antennaWag is unused now that
-  // there's no chassis — it stays in the param dict for parity but no
-  // mesh listens to it.)
+  // tremor, antennaWag) on the resolved param dict. Here we apply the
+  // actual oscillations to the device transform and to each antenna's
+  // wag pivot.
   _applyBodyMotion(t, p) {
     const breathScale = 1 + 0.025 * p.breathing * Math.sin(t * 1.2);
     this.deviceGroup.scale.setScalar(breathScale);
@@ -250,6 +412,13 @@ export class EmojiAvatarV2 {
     this.deviceGroup.rotation.x = Math.sin(t * 0.3) * 0.02;
     this.deviceGroup.position.y = p.headBob * 0.06 * Math.sin(t * 4);
     this.deviceGroup.position.x = p.tremor * 0.012 * Math.sin(t * 28);
+
+    if (this._antennae) {
+      for (const a of this._antennae) {
+        const wag = a.userData.sign * p.antennaWag * 0.18 * Math.sin(t * 3 + a.userData.sign);
+        a.rotation.z = a.userData.baseTilt + wag;
+      }
+    }
   }
 
   _applyEffects(t, p) {

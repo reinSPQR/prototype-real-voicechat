@@ -24,15 +24,17 @@ import * as THREE from 'three';
 const CYAN  = 0x8ce6ff;
 const WHITE = 0xffffff;
 
-// Tuned to fit the screen plate inside the dome (roughly 2 wide × 1 tall).
-const EYE_DX     = 0.55;     // horizontal offset of each eye from center
-const EYE_BASE   = 0.22;     // base eye radius
-const EYE_Y      = 0.05;     // vertical offset for the eye row
+// Tuned to fit the screen plate (1.85 wide × 1.15 tall). Eye row sits a hair
+// above center; mouth sits in the lower-middle so the face has the
+// "small features inside a generous black plate" look from the reference.
+const EYE_DX     = 0.42;     // horizontal offset of each eye from center
+const EYE_BASE   = 0.17;     // base eye radius (smaller — leaves screen breathing room)
+const EYE_Y      = 0.10;     // vertical offset for the eye row
 const EYE_Z      = 0.0;      // depth offset for the eye anchor
 const FRONT_Z    = 0.06;     // strokes sit forward of the fill (so they read on top)
-const MOUTH_Y    = -0.42;    // vertical offset of the mouth from face center
-const MOUTH_W0   = 0.34;     // base half-width of the mouth at width=1, size=1
-const MOUTH_H0   = 0.20;     // base "interior height" — drives curl/open scale
+const MOUTH_Y    = -0.25;    // vertical offset of the mouth from face center
+const MOUTH_W0   = 0.22;     // base half-width of the mouth at width=1, size=1
+const MOUTH_H0   = 0.16;     // base "interior height" — drives curl/open scale
 
 export class FaceRig {
   constructor(parent) {
@@ -147,15 +149,25 @@ export class FaceRig {
     this._mouthKey = '';
   }
 
-  // Build a closed loop through 4 control points:
-  //   leftCorner → upperMid → rightCorner → lowerMid (clockwise).
+  // Build the mouth boundary as two quadratic Béziers meeting at the
+  // corners — the upper arc for the top of the mouth, the lower arc for
+  // the bottom. This produces a clean banana / lens / oval shape with
+  // smooth tangents at the corners. (Closed CatmullRom on 4 points has
+  // vertical tangents at the corners and oscillates, which reads as a
+  // creepy cusped sliver.)
   //
-  // SMILE convention (curl > 0): both midpoints sit BELOW the corners
-  // (negative Y), so the corners ride higher than the middle — the U
-  // shape that reads as a smile. Frown (curl < 0) is the mirror image.
-  // mouthOpen separates the two midpoints vertically (creating an
-  // interior). BASE_GAP·H keeps a visible thickness even when open=0
-  // since this is a solid fill, not a stroked outline.
+  // Geometry plan:
+  //   centerY  = the smile-axis y-coord at x=0 — NEGATIVE for a smile so
+  //              the mouth's middle dips below center, POSITIVE for frown.
+  //   cornerY  = riding OPPOSITE the centerline so a smile lifts the
+  //              corners up while the middle drops, doubling the U.
+  //   halfT    = half-thickness of the lips perpendicular to the
+  //              centerline. BASE_GAP gives a visible closed-mouth fill;
+  //              mouthOpen adds an audible gape on top.
+  //
+  // Quadratic Bézier midpoint: B(0.5) = 0.25·S + 0.5·C + 0.25·E.
+  // To land on (0, midY) given symmetric corners, the control needs to
+  // sit at (0, 2·midY - cornerY).
   //
   // This single primitive covers every observed mouth:
   //   happy U-smile     → curl=+1,   open=0
@@ -178,30 +190,24 @@ export class FaceRig {
     const W = MOUTH_W0 * width * size;
     const H = MOUTH_H0 * size;
 
-    // Note the negated curl — see direction convention above.
-    const BASE_GAP = 0.18;
-    const upperY = -curl * 0.55 * H + (BASE_GAP + open * 0.5) * H;
-    const lowerY = -curl * 0.55 * H - (BASE_GAP + open * 0.5) * H;
+    const centerY = -curl * 0.55 * H;
+    const cornerY = +curl * 0.30 * H;
+    const BASE_GAP = 0.25;
+    const halfT = (BASE_GAP + open * 0.5) * H;
 
-    const pts = [
-      new THREE.Vector3(-W, 0,      0),
-      new THREE.Vector3( 0, upperY, 0),
-      new THREE.Vector3(+W, 0,      0),
-      new THREE.Vector3( 0, lowerY, 0),
-    ];
-    const curve = new THREE.CatmullRomCurve3(pts, /* closed */ true);
+    const upperMidY = centerY + halfT;
+    const lowerMidY = centerY - halfT;
+    const upperCtrlY = 2 * upperMidY - cornerY;
+    const lowerCtrlY = 2 * lowerMidY - cornerY;
 
-    // Sample the closed curve and feed the boundary into a Shape so
-    // ShapeGeometry triangulates it as a SOLID FILL.
-    const samples = curve.getPoints(64);
     const shape = new THREE.Shape();
-    shape.moveTo(samples[0].x, samples[0].y);
-    for (let i = 1; i < samples.length; i++) {
-      shape.lineTo(samples[i].x, samples[i].y);
-    }
+    shape.moveTo(-W, cornerY);
+    shape.quadraticCurveTo(0, upperCtrlY, +W, cornerY);   // top arc, L→R
+    shape.quadraticCurveTo(0, lowerCtrlY, -W, cornerY);   // bottom arc, R→L
     shape.closePath();
 
-    const geom = new THREE.ShapeGeometry(shape);
+    // 24 curve segments per Bézier — smooth at this scale.
+    const geom = new THREE.ShapeGeometry(shape, 24);
     this.mouthMesh = new THREE.Mesh(geom, this.mouthMat);
     this.mouthGroup.add(this.mouthMesh);
   }
